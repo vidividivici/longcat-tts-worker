@@ -107,5 +107,15 @@ def handler(job):
         return {"voices": list_voices()}
     return {"error": f"unknown action {action}"}
 
+def warmup():
+    # the first generation after boot is ~3x slower (CUDA kernel loading); pay that before taking jobs
+    v = list_voices()
+    if v:
+        t = time.time()
+        generate(v[0], "Warming up.")
+        print(f"warmup generation {time.time() - t:.1f}s, total boot {time.time() - T0:.1f}s", flush=True)
+
 if __name__ == "__main__":
+    if "--test_input" not in sys.argv:
+        warmup()
     runpod.serverless.start({"handler": handler})

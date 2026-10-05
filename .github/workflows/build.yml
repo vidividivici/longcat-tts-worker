@@ -27,6 +27,9 @@ jobs:
           context: .
           push: true
           provenance: false
+          # registry cache: unchanged layers (base, deps, weights) keep their digests, so RunPod only re-pulls what changed
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max
           tags: |
             ghcr.io/${{ github.repository }}:latest
             ghcr.io/${{ github.repository }}:${{ github.sha }}
