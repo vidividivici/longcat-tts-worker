@@ -1,4 +1,4 @@
-import base64, io, os, re, shutil, sys, time
+import base64, hashlib, io, os, re, sys, time, urllib.request
 
 T0 = time.time()
 sys.path.insert(0, os.environ.get("LONGCAT_CODE", "/app/longcat"))
@@ -11,7 +11,8 @@ from utils import normalize_text, approx_duration_from_text
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/models/longcat")
 WHISPER_DIR = os.environ.get("WHISPER_DIR", "/models/whisper")
-VDIR = os.environ.get("VOICES_DIR", "/runpod-volume/voices")
+VDIR = os.environ.get("VOICES_DIR", "/runpod-volume/voices")  # legacy network volume, only used for export
+CACHE = "/tmp/voices"
 MAX_REF = 28.0
 
 model = AudioDiTModel.from_pretrained(MODEL_DIR, dtype=torch.float32).to("cuda")
@@ -63,22 +64,30 @@ def create_voice(name, audio_b64):
         total += b - a
     ref = np.concatenate(pieces)
     ref = ref / (np.abs(ref).max() + 1e-6) * 0.9
-    os.makedirs(f"{VDIR}/{name}", exist_ok=True)
-    sf.write(f"{VDIR}/{name}/ref.wav", ref, sr)
-    open(f"{VDIR}/{name}/text.txt", "w").write(" ".join(texts))
-    return {"name": name, "text": " ".join(texts), "voices": list_voices()}
+    # the Vercel proxy stores the voice (Vercel Blob); the worker keeps no state
+    return {"name": name, "text": " ".join(texts), "ref_wav": wav_b64(ref)}
+
+def fetch(url):
+    # voice files are immutable blobs (random-suffixed names), so cache them for the worker's lifetime
+    os.makedirs(CACHE, exist_ok=True)
+    path = f"{CACHE}/{hashlib.sha1(url.encode()).hexdigest()}"
+    if not os.path.exists(path):
+        with urllib.request.urlopen(url, timeout=30) as r:
+            data = r.read()
+        open(path + ".part", "wb").write(data); os.replace(path + ".part", path)
+    return path
+
+def load_voice(inp):
+    if inp.get("ref_url") and inp.get("text_url"):
+        return librosa.load(fetch(inp["ref_url"]), sr=sr, mono=True)[0], open(fetch(inp["text_url"]), encoding="utf-8").read()
+    return None, None
 
 @torch.no_grad()
-def generate(voice, text, steps=32, max_prompt_sec=None):
-    voice = safe_name(voice)
-    if not os.path.exists(f"{VDIR}/{voice}/ref.wav"):
-        return {"error": f"Voice '{voice}' not found"}
+def generate(a, pt, text, steps=32):
+    if a is None:
+        return {"error": "Voice not found"}
     if not (text or "").strip():
         return {"error": "Empty text"}
-    a, _ = librosa.load(f"{VDIR}/{voice}/ref.wav", sr=sr, mono=True)
-    if max_prompt_sec:
-        a = a[: int(max_prompt_sec * sr)]
-    pt = open(f"{VDIR}/{voice}/text.txt").read()
     seed = int(np.random.randint(0, 2**31))
     torch.manual_seed(seed); torch.cuda.manual_seed(seed)
     pt_n, tx_n = normalize_text(pt), normalize_text(text)
@@ -96,26 +105,29 @@ def generate(voice, text, steps=32, max_prompt_sec=None):
 def handler(job):
     inp = job["input"]
     action = inp.get("action")
-    if action == "warmup" or action == "list_voices":
-        return {"voices": list_voices()}
+    if action == "warmup":
+        return {"ok": True}
     if action == "generate":
-        return generate(inp.get("voice"), inp.get("text"))
+        a, pt = load_voice(inp)
+        return generate(a, pt, inp.get("text"))
     if action == "create_voice":
         return create_voice(inp.get("name"), inp.get("audio"))
-    if action == "delete_voice":
-        n = safe_name(inp.get("name"))
-        if n and os.path.isdir(f"{VDIR}/{n}"):
-            shutil.rmtree(f"{VDIR}/{n}")
+    if action == "list_volume_voices":  # one-off migration from the old network volume
         return {"voices": list_voices()}
+    if action == "export_voice":
+        n = safe_name(inp.get("name"))
+        if not os.path.exists(f"{VDIR}/{n}/ref.wav"):
+            return {"error": f"Voice '{n}' not found"}
+        return {"name": n, "text": open(f"{VDIR}/{n}/text.txt", encoding="utf-8").read(),
+                "ref_wav": base64.b64encode(open(f"{VDIR}/{n}/ref.wav", "rb").read()).decode()}
     return {"error": f"unknown action {action}"}
 
 def warmup():
     # the first generation after boot is ~3x slower (CUDA kernel loading); pay that before taking jobs
-    v = list_voices()
-    if v:
-        t = time.time()
-        generate(v[0], "Hi.", steps=2, max_prompt_sec=3)  # tiny: just loads the kernels
-        print(f"warmup generation {time.time() - t:.1f}s, total boot {time.time() - T0:.1f}s", flush=True)
+    t = time.time()
+    noise = (np.random.randn(3 * sr) * 0.01).astype(np.float32)
+    generate(noise, "Hello there.", "Hi.", steps=2)  # tiny: just loads the kernels
+    print(f"warmup generation {time.time() - t:.1f}s, total boot {time.time() - T0:.1f}s", flush=True)
 
 if __name__ == "__main__":
     if "--test_input" not in sys.argv:
