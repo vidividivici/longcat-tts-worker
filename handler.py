@@ -46,7 +46,8 @@ def create_voice(name, audio_b64):
     name = safe_name(name) or "voice"
     audio, _ = librosa.load(io.BytesIO(base64.b64decode(audio_b64)), sr=sr, mono=True)
     audio = audio[: int(60 * sr)]
-    segs, _ = whisper().transcribe(audio, beam_size=5, vad_filter=True)
+    # faster-whisper expects 16 kHz when given an array; timestamps are in seconds either way
+    segs, _ = whisper().transcribe(librosa.resample(audio, orig_sr=sr, target_sr=16000), beam_size=5, vad_filter=True)
     segs = [s for s in segs if s.text.strip()]
     if not segs:
         return {"error": "No speech found in the file"}
