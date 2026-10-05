@@ -69,13 +69,15 @@ def create_voice(name, audio_b64):
     return {"name": name, "text": " ".join(texts), "voices": list_voices()}
 
 @torch.no_grad()
-def generate(voice, text):
+def generate(voice, text, steps=32, max_prompt_sec=None):
     voice = safe_name(voice)
     if not os.path.exists(f"{VDIR}/{voice}/ref.wav"):
         return {"error": f"Voice '{voice}' not found"}
     if not (text or "").strip():
         return {"error": "Empty text"}
     a, _ = librosa.load(f"{VDIR}/{voice}/ref.wav", sr=sr, mono=True)
+    if max_prompt_sec:
+        a = a[: int(max_prompt_sec * sr)]
     pt = open(f"{VDIR}/{voice}/text.txt").read()
     seed = int(np.random.randint(0, 2**31))
     torch.manual_seed(seed); torch.cuda.manual_seed(seed)
@@ -88,7 +90,7 @@ def generate(voice, text):
     d = approx_duration_from_text(tx_n, max_duration=maxd - ptime) * np.clip(ptime / approx_duration_from_text(pt_n, maxd), 1.0, 1.5)
     dur = min(int(d * sr // hop) + pdur, int(maxd * sr // hop))
     out = model(input_ids=inp.input_ids, attention_mask=inp.attention_mask, prompt_audio=pw.unsqueeze(0),
-                duration=dur, steps=32, cfg_strength=4.0, guidance_method="apg")
+                duration=dur, steps=steps, cfg_strength=4.0, guidance_method="apg")
     return {"audio": wav_b64(out.waveform.squeeze().float().cpu().numpy())}
 
 def handler(job):
@@ -112,7 +114,7 @@ def warmup():
     v = list_voices()
     if v:
         t = time.time()
-        generate(v[0], "Warming up.")
+        generate(v[0], "Hi.", steps=2, max_prompt_sec=3)  # tiny: just loads the kernels
         print(f"warmup generation {time.time() - t:.1f}s, total boot {time.time() - T0:.1f}s", flush=True)
 
 if __name__ == "__main__":
