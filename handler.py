@@ -7,7 +7,7 @@ import runpod
 import audiodit  # registers the model with transformers
 from audiodit import AudioDiTModel
 from transformers import AutoTokenizer
-from utils import normalize_text, approx_duration_from_text
+from utils import normalize_text, approx_duration_from_text, normalize_volume
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/models/longcat")
 WHISPER_DIR = os.environ.get("WHISPER_DIR", "/models/whisper")
@@ -92,7 +92,8 @@ def generate(a, pt, text, steps=32):
     torch.manual_seed(seed); torch.cuda.manual_seed(seed)
     pt_n, tx_n = normalize_text(pt), normalize_text(text)
     inp = tok([f"{pt_n} {tx_n}"], padding="longest", return_tensors="pt")
-    pw = torch.from_numpy(a).unsqueeze(0)
+    # same -6 dBFS peak normalisation the model was trained with (upstream utils.load_audio fix, 2026-10-15)
+    pw = normalize_volume(torch.from_numpy(a).unsqueeze(0), -6)
     x = F.pad(pw, (0, (-pw.shape[-1]) % hop)); x = F.pad(x, (0, hop * 3))
     pdur = model.vae.encode(x.unsqueeze(0).cuda())[..., :-3].shape[-1]
     ptime = pdur * hop / sr

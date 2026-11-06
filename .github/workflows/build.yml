@@ -1,7 +1,7 @@
 name: build
 on:
   push:
-    branches: [main]
+    branches: ['**']
   workflow_dispatch:
 permissions:
   contents: read
@@ -30,6 +30,7 @@ jobs:
           # registry cache: unchanged layers (base, deps, weights) keep their digests, so RunPod only re-pulls what changed
           cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
           cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max
+          # :latest only from main (the live endpoint); other branches get just the :<sha> tag for testing
           tags: |
-            ghcr.io/${{ github.repository }}:latest
             ghcr.io/${{ github.repository }}:${{ github.sha }}
+            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}:latest', github.repository) || '' }}
