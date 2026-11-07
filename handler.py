@@ -78,11 +78,22 @@ def split_windows(words, total, length=CLONE_LEN, min_len=CLONE_MIN, search=PAUS
     A window ends in a pause: the latest gap of at least 0.2 s between two words in its last `search` seconds,
     else the longest gap there. The first window starts just before the first word; a last window shorter than
     `min_len` is dropped (unless it is the only one). Returns [(start, end, [words])]."""
+    # Whisper's last words can have timestamps past the end of the audio or out of order: clamp and sort
+    clean, last = [], 0.0
+    for a, b, w in words:
+        a = min(max(a, last), total)
+        if a >= total - 0.05:
+            break
+        clean.append((a, min(max(b, a), total), w))
+        last = a
+    words = clean
     out, i = [], 0
     while i < len(words):
         start = max(0.0, words[i][0] - 0.15, out[-1][1] if out else 0.0)
         limit = min(total, start + length)
         j = i  # end (exclusive) of the words that fit
+        if total <= start + length:
+            j = len(words)  # the rest of the recording fits: one last window
         while j < len(words) and words[j][1] + 0.05 <= limit:
             j += 1
         if j == i:  # one "word" longer than the window (rare ASR artefact): take it, cut off
