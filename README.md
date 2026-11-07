@@ -11,7 +11,8 @@ Actions (`input.action`): `warmup`, `generate {text, ref_url, text_url}` → `{a
 `create_clones` transcribes a recording (the first 180 s) once with word timestamps and splits it into consecutive
 references of at most 30 s, one voice clone each; a last piece under 8 s is dropped. Each cut is placed in a pause
 found in the audio itself (the latest quiet stretch of 0.12 s or more in the window's last 3 s, else its quietest 30 ms),
-because Whisper's word times are often a few hundred ms off; words go to the window holding their middle. A word running
+because Whisper's word times are often a few hundred ms off. Each window is then transcribed on its own: with the
+word times a word at a cut could land in the wrong window, and LongCat then repeats that word at the start of its output. A word running
 past 180 s is left out rather than cut (the browser sends a few seconds more for this). It returns only
 the cut points and transcripts: the web proxy cuts the references from the same file. Why 30 s: the reference and the
 output share LongCat's 60 s window (`max_wav_duration` = 60 in the model config; `generate()` gives the output

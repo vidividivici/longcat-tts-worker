@@ -143,7 +143,14 @@ def create_clones(audio_url, length=CLONE_LEN, total=CLONE_TOTAL):
     if not words:
         return {"error": "No speech found in the recording"}
     wins = split_audio(audio, 16000, words, dur, length)
-    return {"clones": [{"start": a, "end": b, "text": "".join(w[2] for w in ws).strip()} for a, b, ws in wins]}
+    # each reference's transcript must match its audio exactly, or LongCat repeats the words at the seams at the
+    # start of its output: transcribe every window on its own (the words from above can be a word off at a cut)
+    clones = []
+    for a, b, ws in wins:
+        part, _ = whisper().transcribe(audio[int(a * 16000): int(b * 16000)], beam_size=5, condition_on_previous_text=False)
+        text = " ".join(s.text.strip() for s in part).strip() or "".join(w[2] for w in ws).strip()
+        clones.append({"start": a, "end": b, "text": text})
+    return {"clones": clones}
 
 def fetch(url):
     # voice files are immutable blobs (random-suffixed names), so cache them for the worker's lifetime
