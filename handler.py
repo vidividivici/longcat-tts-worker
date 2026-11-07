@@ -14,6 +14,12 @@ WHISPER_DIR = os.environ.get("WHISPER_DIR", "/models/whisper")
 VDIR = os.environ.get("VOICES_DIR", "/runpod-volume/voices")  # legacy network volume, only used for export
 CACHE = "/tmp/voices"
 MAX_REF = 28.0
+# create_clones: a recording (up to CLONE_TOTAL s) is split into consecutive references of up to CLONE_LEN s,
+# one voice clone each. Reference + output share LongCat's 60 s window (max_wav_duration), and similarity
+# stops improving at ~20 s of reference, so 30 s leaves 30 s for the output. Under CLONE_MIN s a clone
+# sounds clearly less like the speaker, so a shorter last piece is dropped (measured, see README).
+CLONE_LEN, CLONE_TOTAL, CLONE_MIN = 30.0, 180.0, 8.0
+PAUSE_SEARCH = 3.0   # look this far back from a window's end for a pause to cut at
 
 model = AudioDiTModel.from_pretrained(MODEL_DIR, dtype=torch.float32).to("cuda")
 model.vae.to_half()
@@ -67,6 +73,47 @@ def create_voice(name, audio_b64):
     # the Vercel proxy stores the voice (Vercel Blob); the worker keeps no state
     return {"name": name, "text": " ".join(texts), "ref_wav": wav_b64(ref)}
 
+def split_windows(words, total, length=CLONE_LEN, min_len=CLONE_MIN, search=PAUSE_SEARCH):
+    """Split timed words [(start, end, word)] into consecutive windows of whole words, each at most `length` s.
+    A window ends in a pause: the latest gap of at least 0.2 s between two words in its last `search` seconds,
+    else the longest gap there. The first window starts just before the first word; a last window shorter than
+    `min_len` is dropped (unless it is the only one). Returns [(start, end, [words])]."""
+    out, i = [], 0
+    while i < len(words):
+        start = max(0.0, words[i][0] - 0.15, out[-1][1] if out else 0.0)
+        limit = min(total, start + length)
+        j = i  # end (exclusive) of the words that fit
+        while j < len(words) and words[j][1] + 0.05 <= limit:
+            j += 1
+        if j == i:  # one "word" longer than the window (rare ASR artefact): take it, cut off
+            j = i + 1
+        elif j < len(words):  # more speech follows: cut in a pause near the end
+            gaps = [(k, words[k][0] - words[k - 1][1]) for k in range(i + 1, j + 1) if words[k - 1][1] >= limit - search]
+            if gaps:
+                pauses = [g for g in gaps if g[1] >= 0.2]
+                j = max(pauses)[0] if pauses else max(gaps, key=lambda g: g[1])[0]
+        # end halfway into the pause (at most 0.25 s after the last word), or shortly after the last word
+        tail = min(0.25, (words[j][0] - words[j - 1][1]) / 2) if j < len(words) else 0.3
+        end = min(limit, total, words[j - 1][1] + max(0.0, tail))
+        out.append((round(start, 2), round(end, 2), words[i:j]))
+        i = j
+    if len(out) > 1 and out[-1][1] - out[-1][0] < min_len:
+        out.pop()  # too short to sound like the speaker
+    return out
+
+def create_clones(audio_url, length=CLONE_LEN, total=CLONE_TOTAL):
+    """Transcribe a recording once and split it into voice-clone references. Returns only the cut points
+    and transcripts; the Vercel proxy cuts the references from the same file (it already has it)."""
+    if not audio_url:
+        return {"error": "No recording"}
+    audio = librosa.load(fetch(audio_url), sr=16000, mono=True)[0][: int(total * 16000)]
+    segs, _ = whisper().transcribe(audio, beam_size=5, vad_filter=True, word_timestamps=True)
+    words = [(w.start, w.end, w.word) for s in segs for w in (s.words or []) if w.word.strip()]
+    if not words:
+        return {"error": "No speech found in the recording"}
+    wins = split_windows(words, len(audio) / 16000, length)
+    return {"clones": [{"start": a, "end": b, "text": "".join(w[2] for w in ws).strip()} for a, b, ws in wins]}
+
 def fetch(url):
     # voice files are immutable blobs (random-suffixed names), so cache them for the worker's lifetime
     os.makedirs(CACHE, exist_ok=True)
@@ -113,6 +160,9 @@ def handler(job):
         return generate(a, pt, inp.get("text"))
     if action == "create_voice":
         return create_voice(inp.get("name"), inp.get("audio"))
+    if action == "create_clones":
+        out = create_clones(inp.get("audio_url"), min(max(float(inp.get("length") or CLONE_LEN), CLONE_MIN), CLONE_LEN))
+        return out if "error" in out else {"name": safe_name(inp.get("name")) or "voice", **out}
     if action == "list_volume_voices":  # one-off migration from the old network volume
         return {"voices": list_voices()}
     if action == "export_voice":
