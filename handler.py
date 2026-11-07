@@ -73,41 +73,58 @@ def create_voice(name, audio_b64):
     # the Vercel proxy stores the voice (Vercel Blob); the worker keeps no state
     return {"name": name, "text": " ".join(texts), "ref_wav": wav_b64(ref)}
 
-def split_windows(words, total, length=CLONE_LEN, min_len=CLONE_MIN, search=PAUSE_SEARCH):
-    """Split timed words [(start, end, word)] into consecutive windows of whole words, each at most `length` s.
-    A window ends in a pause: the latest gap of at least 0.2 s between two words in its last `search` seconds,
-    else the longest gap there. The first window starts just before the first word; a last window shorter than
+def split_audio(audio, rate, words, total, length=CLONE_LEN, min_len=CLONE_MIN, search=PAUSE_SEARCH):
+    """Split a recording into consecutive windows of at most `length` s, each cut in a pause found in the audio
+    itself (Whisper's word times can be off by a few hundred ms, too much to cut by): the latest quiet stretch of
+    at least 0.12 s in a window's last `search` s, else its quietest 30 ms. Timed words [(start, end, word)] go to
+    the window holding their middle, so each window's transcript matches its audio. A last window shorter than
     `min_len` is dropped (unless it is the only one). Returns [(start, end, [words])]."""
-    # Whisper's last words can have timestamps past the end of the audio or out of order: clamp and sort
-    clean, last = [], 0.0
-    for a, b, w in words:
-        a = min(max(a, last), total)
-        if a >= total - 0.05:
-            break
-        clean.append((a, min(max(b, a), total), w))
-        last = a
-    words = clean
-    out, i = [], 0
+    hop, win = int(0.01 * rate), int(0.03 * rate)
+    x = audio[: int(total * rate)].astype(np.float64) ** 2
+    c = np.concatenate([[0.0], np.cumsum(x)])
+    n = max(1, (len(x) - win) // hop + 1)
+    idx = np.arange(n) * hop
+    db = 10 * np.log10((c[np.minimum(idx + win, len(x))] - c[idx]) / win + 1e-12)
+    quiet = db < np.percentile(db, 95) - 30  # well below the speech level of this recording
+
+    def cut_in(lo, hi):
+        f0, f1 = max(0, int(lo * 100)), min(n, int(hi * 100))
+        if f1 <= f0:
+            return hi
+        q, best, k = quiet[f0:f1], None, len(quiet[f0:f1]) - 1
+        while k >= 0:  # latest quiet run of >= 12 frames
+            if q[k]:
+                j = k
+                while j >= 0 and q[j]:
+                    j -= 1
+                if k - j >= 12:
+                    best = (j + 1 + k) / 2
+                    break
+                k = j
+            k -= 1
+        if best is None:
+            best = int(np.argmin(db[f0:f1]))
+        return round((f0 + best) * 0.01 + 0.015, 2)
+
+    words = [(max(0.0, a), min(max(b, a), total), w) for a, b, w in words if a < total]
+    if not words:
+        return []
+    mid = lambda w: (w[0] + w[1]) / 2
+    out, start, i = [], max(0.0, words[0][0] - 0.3), 0
     while i < len(words):
-        start = max(0.0, words[i][0] - 0.15, out[-1][1] if out else 0.0)
-        limit = min(total, start + length)
-        j = i  # end (exclusive) of the words that fit
-        if total <= start + length:
-            j = len(words)  # the rest of the recording fits: one last window
-        while j < len(words) and words[j][1] + 0.05 <= limit:
+        limit = start + length
+        if total <= limit:
+            end = min(total, words[-1][1] + 0.3)
+        else:
+            end = cut_in(max(start + 1.0, limit - search), limit)
+        j = i
+        while j < len(words) and mid(words[j]) < end:
             j += 1
-        if j == i:  # one "word" longer than the window (rare ASR artefact): take it, cut off
-            j = i + 1
-        elif j < len(words):  # more speech follows: cut in a pause near the end
-            gaps = [(k, words[k][0] - words[k - 1][1]) for k in range(i + 1, j + 1) if words[k - 1][1] >= limit - search]
-            if gaps:
-                pauses = [g for g in gaps if g[1] >= 0.2]
-                j = max(pauses)[0] if pauses else max(gaps, key=lambda g: g[1])[0]
-        # end halfway into the pause (at most 0.25 s after the last word), or shortly after the last word
-        tail = min(0.25, (words[j][0] - words[j - 1][1]) / 2) if j < len(words) else 0.3
-        end = min(limit, total, words[j - 1][1] + max(0.0, tail))
-        out.append((round(start, 2), round(end, 2), words[i:j]))
+        if j > i:
+            out.append((round(start, 2), round(end, 2), words[i:j]))
         i = j
+        if i < len(words):  # don't open the next window with a long silence
+            start = end if words[i][0] - end < 1.0 else round(words[i][0] - 0.3, 2)
     if len(out) > 1 and out[-1][1] - out[-1][0] < min_len:
         out.pop()  # too short to sound like the speaker
     return out
@@ -117,12 +134,15 @@ def create_clones(audio_url, length=CLONE_LEN, total=CLONE_TOTAL):
     and transcripts; the Vercel proxy cuts the references from the same file (it already has it)."""
     if not audio_url:
         return {"error": "No recording"}
-    audio = librosa.load(fetch(audio_url), sr=16000, mono=True)[0][: int(total * 16000)]
+    # the browser sends a few seconds more than `total`, so the words around the limit are transcribed properly;
+    # a word that runs past the limit is left out instead of being cut in half
+    audio = librosa.load(fetch(audio_url), sr=16000, mono=True)[0][: int((total + 10) * 16000)]
     segs, _ = whisper().transcribe(audio, beam_size=5, vad_filter=True, word_timestamps=True)
-    words = [(w.start, w.end, w.word) for s in segs for w in (s.words or []) if w.word.strip()]
+    dur = min(len(audio) / 16000, total)
+    words = [(w.start, w.end, w.word) for s in segs for w in (s.words or []) if w.word.strip() and w.end <= dur]
     if not words:
         return {"error": "No speech found in the recording"}
-    wins = split_windows(words, len(audio) / 16000, length)
+    wins = split_audio(audio, 16000, words, dur, length)
     return {"clones": [{"start": a, "end": b, "text": "".join(w[2] for w in ws).strip()} for a, b, ws in wins]}
 
 def fetch(url):
